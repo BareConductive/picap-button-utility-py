@@ -8,11 +8,11 @@
 #
 # Written for Raspberry Pi.
 #
-# Bare Conductive code written by Szymon Kaliski.
+# Bare Conductive code written by Szymon Kaliski and Tom Hartley.
 #
 # This work is licensed under a MIT license https://opensource.org/licenses/MIT
 #
-# Copyright (c) 2016, Bare Conductive
+# Copyright (c) 2018, Bare Conductive
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -34,115 +34,71 @@
 #
 #################################################################################
 
-from time import sleep, time
 from subprocess import call
-import signal, sys, getopt
-import RPi.GPIO as GPIO
-
-GPIO.setmode(GPIO.BOARD)
+import signal, argparse
+import gpiozero
+import threading
 
 # app settings
-button_pin          = 7
-doublepress_timeout = 0.30
+button_pin          = 4    # gpiozero uses BCM pin numbering
+doublepress_timeout = 0.3
 longpress_timeout   = 0.75
 
 # our state
-last_pressed    = None
-last_released   = None
-is_pressed      = False
+ignoreRelease = False
 
-# press commands
-singlepress_cmd = "echo \"Hello World\" &"
-doublepress_cmd = "sync && reboot now &"
-longpress_cmd   = "sync && halt &"
-
-# handle ctrl+c gracefully
-def signal_handler(signal, frame):
-  GPIO.cleanup()
-  sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-
-# print help
-def print_help():
-  print "Maps three different PiCap button events to system calls - MUST be run as root.\n"
-  print "Usage: python button-utility.py [OPTION]\n"
-  print "By default single press      echoes \"Hello World!\""
-  print "           double press      restarts"
-  print "           long press        shuts down\n"
-  print "Options:"
-  print "  -s, --single-press [CMD]   executes [CMD] on button single press"
-  print "  -d, --double-press [CMD]   executes [CMD] on button double press"
-  print "  -l, --long-press   [CMD]   executes [CMD] on button long press"
-  print "  -h, --help                 displays this message"
-  sys.exit(0)
+# Single press: button released, and button not pressed within doublepress_timeout
+# Double press: button released, and pressed again before doublepress_timeout
+# Hold: Button not released until longpress_timeout
 
 # arguments parsing
-def parse_args(argv):
-  # we need to tell python that those variables are global
-  # we don't want to create new local copies, but change global state
-  global singlepress_cmd, doublepress_cmd, longpress_cmd
+def setupargs():
+  # press commands
+  singlepress_cmd = "echo \"Hello World\" &"
+  doublepress_cmd = "sync && reboot now &"
+  longpress_cmd   = "sync && halt &"
+  
+  parser = argparse.ArgumentParser(description='''Maps three different PiCap button events to system calls - MUST be run as root. By default, a single press prints "Hello World" to the console, a double press reboots, and a long press triggers a shut down.''')
+  parser.add_argument('-s','--single-press', nargs='?', metavar='CMD', dest = 'singlepress_cmd', type=str, default=singlepress_cmd, 
+                      help='command to execute on button single press')
+  parser.add_argument('-d','--double-press', nargs='?', metavar='CMD', dest = 'doublepress_cmd', type=str, default=doublepress_cmd, 
+                      help='command to execute on button double press')
+  parser.add_argument('-l','--long-press', nargs='?', metavar='CMD', dest = 'longpress_cmd', type=str, default=longpress_cmd, 
+                      help='command to execute on button long press')
+  
+  return parser.parse_args()
 
-  try:
-    opts, args = getopt.getopt(argv, "s:d:l:h", [ "single-press=", "double-press=", "long-press=", "help" ])
-  except getopt.GetoptError:
-    print_help()
+args = setupargs()
+button = gpiozero.Button(4,bounce_time=0.01,hold_time=longpress_timeout)
 
-  for opt, arg in opts:
-    if opt in ("-h", "--help"):
-      print_help()
-    elif opt in ("-s", "--single-press"):
-      singlepress_cmd = arg
-    elif opt in ("-l", "--long-press"):
-      longpress_cmd = arg
-    elif opt in ("-d", "--double-press"):
-      doublepress_cmd = arg
-
-# button action callback
-def button_callback(button_pin):
-  # we need to tell python that those variables are global
-  # we don't want to create new local copies, but change global state
-  global is_pressed, last_pressed, last_released
-
-  # state 0 is pressed, 1 is released
-  is_pressed = not GPIO.input(button_pin)
-
-  if is_pressed:
-    last_pressed = time()
+def release_callback(): #wait for another button press, or not
+  global ignoreRelease
+  doublePressed = button.wait_for_press(doublepress_timeout)
+  #here, we wait for a second press. If none comes within the time, we call it a single press
+  if (not doublePressed):
+    call(args.singlepress_cmd, shell = True)
   else:
-    last_released = time()
+    ignoreRelease = True #ignore the next release trigger, as it was caused by the second press
+    call(args.doublepress_cmd, shell = True)
 
-# parse arguments on start
-parse_args(sys.argv[1:])
+def button_released():
+  global ignoreRelease
+  if (ignoreRelease):
+    ignoreRelease = False
+    return
+  t = threading.Thread(target=release_callback) #need to call wait_for_press in a different thread
+  t.start() # this is a workaround for a bug in gpiozero, it won't let you use wait_for press in a handler
 
-# setup button, and add the callback
-# we could do everything in while True looop, but here we get nice handling of button debouncing
-GPIO.setup(button_pin, GPIO.IN, pull_up_down = GPIO.PUD_UP)
-GPIO.add_event_detect(button_pin, GPIO.BOTH, callback = button_callback, bouncetime = 10)
 
-# main code loop
-while True:
-  now = time()
+def button_held():
+  global ignoreRelease
+  if (ignoreRelease):
+    return #someone held the second press of the double press
+  ignoreRelease = True #ignore the next release trigger, as it was caused by the end of the long hold
+  call(args.longpress_cmd, shell = True)
 
-  if is_pressed:
-    # if we get another press before doublepress_timeout of last_released, then it's double press
-    if last_pressed is not None and last_released is not None and last_pressed < (last_released + doublepress_timeout):
-      call(doublepress_cmd, shell = True)
-      last_pressed = None
-      last_released = None
+button.when_held = button_held #triggered after button held for hold_time
+button.when_released = button_released
 
-    # otherwise if last_pressed happened before longpress_timeout from now, we have long press
-    elif last_pressed is not None and last_pressed < (now - longpress_timeout):
-      call(longpress_cmd, shell = True)
-      last_pressed = None
-      last_released = None
-
-  else:
-    # if button got released, and nothing happens in doublepress_timeout time, then we had single press
-    # we could remove the timeout, but then each double press would also register single press
-    if last_released is not None and last_pressed is not None and last_released < (now - doublepress_timeout):
-      call(singlepress_cmd, shell = True)
-      last_pressed = None
-
-  # wait a bit
-  sleep(0.1)
+#keep script active until ctrl-c etc.
+signal.pause()
